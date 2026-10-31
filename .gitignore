@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local settings and credentials
+.env
+.env.*
+!.env.example
+
+# Local user data and generated output
+*.sqlite3
+*.db
+outputs/
+.files/
+tmp/
+.chainlit/translations/
+
+# OS/editor files
+.DS_Store
+.idea/
+.vscode/
