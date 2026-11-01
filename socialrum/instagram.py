@@ -61,33 +61,101 @@ _SINGLE_POST_DATE_PROBE = r'''(() => {
   }
   return {status: "no_scoped_time", caption_count: 1};
 })()'''
-_OWNED_REELS_CAPTION_PROBE = r'''(() => {
-  const selector = 'div[dir="auto"].xvs91rp.xd4r4e8';
+_SOURCE_ASSOCIATION_PROBE = r'''/* SOCIALRUM_SOURCE_ASSOCIATION */ (() => {
+  const selector = "span.x193iq5w.xeuugli.x13faqbe.x1vvkbs.xt0psk2.x1i0vuye.xvs91rp.xo1l8bm.x5n08af.x126k92a";
+  const requested = __REQUESTED_SHORTCODE__;
+  const requestedKind = __REQUESTED_KIND__;
   const visible = (element) => element.getClientRects().length > 0;
-  const videos = [...document.querySelectorAll("video")].filter(visible);
-  if (videos.length === 0) return {status: "no_visible_video"};
-  const firstVideo = videos[0];
-  const candidates = [...document.querySelectorAll(selector)].filter(visible);
-  const matches = [];
-  for (const caption of candidates) {
-    let ancestor = caption.parentElement;
-    for (let hops = 0; ancestor && hops < 24; hops += 1, ancestor = ancestor.parentElement) {
-      if (!ancestor.contains(firstVideo)) continue;
-      const cardVideos = [...ancestor.querySelectorAll("video")].filter(visible);
-      const cardCaptions = [...ancestor.querySelectorAll(selector)].filter(visible);
-      if (cardVideos.length === 1 && cardCaptions.length === 1) {
-        matches.push(caption);
+  const captions = [...document.querySelectorAll(selector)].filter(visible);
+  if (captions.length !== 1) return {status: "unverified", text: null};
+  const caption = captions[0];
+  const text = (caption.innerText || "").replace(/\s+/g, " ").trim().slice(0, 4000);
+  if (!text) return {status: "unverified", text: null};
+  // Do not let a permalink elsewhere in a broad page/main ancestor qualify.
+  const card = caption.closest("article");
+  if (!card || !visible(card)) return {status: "unverified", text};
+  const scopedCaptions = [...card.querySelectorAll(selector)].filter(visible);
+  if (scopedCaptions.length !== 1 || scopedCaptions[0] !== caption) {
+    return {status: "unverified", text};
+  }
+  const postCodes = [...card.querySelectorAll("a[href]")]
+    .filter(visible)
+    .map((anchor) => {
+      try {
+        const link = new URL(anchor.href, location.href);
+        const parts = link.pathname.split("/").filter(Boolean);
+        return link.origin === location.origin && parts.length === 2
+          && ["p", "reel", "reels"].includes(parts[0]) ? parts[1] : null;
+      } catch (_) { return null; }
+    })
+    .filter(Boolean);
+  const codes = [...new Set(postCodes)];
+  const visibleVideos = [...card.querySelectorAll("video")].filter(visible);
+  if (requestedKind !== "p" && visibleVideos.length !== 1) {
+    return {status: "unverified", text};
+  }
+  const verified = codes.length === 1 && codes[0] === requested;
+  return {
+    status: verified ? "unique" : "unverified",
+    shortcode: verified ? requested : null,
+    text
+  };
+})()'''
+_REEL_CARD_CAPTION_PROBE = r'''/* SOCIALRUM_REEL_CARD */ (() => {
+  const selector = 'div[dir="auto"].xvs91rp.xd4r4e8';
+  const requested = __REQUESTED_SHORTCODE__;
+  const visible = (element) => {
+    if (!element.getClientRects().length) return false;
+    for (let node = element; node && node.nodeType === 1; node = node.parentElement) {
+      if (node.hidden || (node.getAttribute("aria-hidden") || "").toLowerCase() === "true") return false;
+      const style = getComputedStyle(node);
+      const opacity = Number.parseFloat(style.opacity);
+      if (style.display === "none" || style.visibility === "hidden"
+          || style.visibility === "collapse" || style.contentVisibility === "hidden"
+          || (Number.isFinite(opacity) && opacity <= 0)) return false;
+    }
+    return true;
+  };
+  const captions = [...document.querySelectorAll(selector)].filter(visible);
+  if (captions.length === 0) return {status: "unverified", candidate_count: 0};
+  const cards = [];
+  for (const caption of captions) {
+    let card = caption.parentElement;
+    for (let hops = 0; card && hops < 16; hops += 1, card = card.parentElement) {
+      const cardCaptions = [...card.querySelectorAll(selector)].filter(visible);
+      const videos = [...card.querySelectorAll("video")].filter(visible);
+      if (cardCaptions.length === 1 && cardCaptions[0] === caption && videos.length === 1) {
+        const codes = [...new Set([...card.querySelectorAll("a[href]")]
+          .filter(visible)
+          .map((anchor) => {
+            try {
+              const link = new URL(anchor.href, location.href);
+              const parts = link.pathname.split("/").filter(Boolean);
+              return link.origin === location.origin && parts.length === 2
+                && ["reel", "reels"].includes(parts[0]) ? parts[1] : null;
+            } catch (_) { return null; }
+          })
+          .filter(Boolean))];
+        cards.push({
+          text: (caption.innerText || "").replace(/\s+/g, " ").trim().slice(0, 4000),
+          shortcode: codes.length === 1 ? codes[0] : null
+        });
         break;
       }
     }
   }
-  if (matches.length !== 1) {
-    return {status: matches.length > 1 ? "ambiguous" : "no_unique_first_card_caption"};
+  const matches = cards.filter((card) => card.shortcode === requested && card.text);
+  if (matches.length === 1) {
+        return {status: "unique", shortcode: requested, text: matches[0].text, candidate_count: captions.length};
   }
-  const text = (matches[0].innerText || "").replace(/\s+/g, " ").trim();
-  if (!text) return {status: "empty_caption"};
-  return {status: "unique", text: text.slice(0, 4000)};
+  if (matches.length > 1 || cards.length > 1) return {status: "ambiguous", candidate_count: captions.length};
+  if (cards.length === 1 && cards[0].text) {
+    return {status: "unverified", shortcode: cards[0].shortcode, text: cards[0].text, candidate_count: captions.length};
+  }
+  return {status: "unverified", candidate_count: captions.length};
 })()'''
+_REEL_CARD_CAPTION_SELECTOR = 'div[dir="auto"].xvs91rp.xd4r4e8'
+_REEL_CAPTION_READY_TIMEOUT = "4s"
 _Runner = Callable[..., Any]
 _CREATOR_HANDLE_RE = re.compile(r"[A-Za-z0-9._]{1,30}\Z")
 _STOP_STATE_RE = re.compile(r"[a-z0-9_]{1,64}\Z")
@@ -212,22 +280,114 @@ def _is_owned_reels_path(path: str) -> bool:
     return len(parts) == 2 and parts[0] == "reels" and bool(parts[1])
 
 
-def _owned_reels_caption(target_id: str, runner: _Runner) -> str:
-    """Read one visible caption only when uniquely tied to the first reel video card."""
-    result = _run_json([
-        "cdp", "--browser-mode", "headed", "eval", _OWNED_REELS_CAPTION_PROBE,
-        "--target", target_id, "--json",
-    ], runner)
+def _has_verified_source_association(
+    path: str, expected_text: str, target_id: str, runner: _Runner,
+) -> bool:
+    """Require the returned caption and permalink in one bounded article card."""
+    parts = path.strip("/").split("/")
+    if len(parts) != 2 or parts[0] not in {"p", "reel", "reels"}:
+        return False
+    probe = _SOURCE_ASSOCIATION_PROBE.replace(
+        "__REQUESTED_SHORTCODE__", json.dumps(parts[1]),
+    ).replace("__REQUESTED_KIND__", json.dumps(parts[0]))
+    try:
+        result = _run_json([
+            "cdp", "--browser-mode", "headed", "eval", probe,
+            "--target", target_id, "--json",
+        ], runner)
+    except RuntimeError:
+        return False
     evaluation = result.get("result")
     value = evaluation.get("value") if isinstance(evaluation, dict) else None
+    return (
+        isinstance(value, dict)
+        and value.get("status") == "unique"
+        and value.get("shortcode") == parts[1]
+        and isinstance(value.get("text"), str)
+        and " ".join(value["text"].split())[:MAX_POST_TEXT_CHARS]
+        == " ".join(expected_text.split())[:MAX_POST_TEXT_CHARS]
+    )
+
+
+def _owned_reel_caption(
+    path: str, target_id: str, runner: _Runner,
+) -> tuple[str | None, bool]:
+    """Read only a one-video caption card, verifying its same-card reel link."""
+    parts = path.strip("/").split("/")
+    if len(parts) != 2 or parts[0] not in {"reel", "reels"}:
+        return None, False
+    probe = _REEL_CARD_CAPTION_PROBE.replace("__REQUESTED_SHORTCODE__", json.dumps(parts[1]))
+
+    def read_probe() -> dict[str, Any] | None:
+        try:
+            result = _run_json([
+                "cdp", "--browser-mode", "headed", "eval", probe,
+                "--target", target_id, "--json",
+            ], runner)
+        except RuntimeError:
+            return None
+        evaluation = result.get("result")
+        value = evaluation.get("value") if isinstance(evaluation, dict) else None
+        return value if isinstance(value, dict) else None
+
+    value = read_probe()
+    candidate_count = value.get("candidate_count") if isinstance(value, dict) else None
+    if type(candidate_count) is not int or candidate_count < 0:
+        return None, False
+    if candidate_count == 0:
+        wait_succeeded = False
+        try:
+            wait_result = _run_json([
+                "cdp", "--browser-mode", "headed", "wait", "selector",
+                _REEL_CARD_CAPTION_SELECTOR, "--target", target_id,
+                "--timeout", _REEL_CAPTION_READY_TIMEOUT, "--json",
+            ], runner)
+            wait_info = wait_result.get("wait")
+            wait_succeeded = isinstance(wait_info, dict) and wait_info.get("matched") is True
+        except RuntimeError:
+            pass
+        # A challenge or login wall may appear while waiting; reclassify before
+        # another DOM read and preserve the established stop behavior.
+        _require_clear_stop_state(target_id, runner)
+        if not wait_succeeded:
+            return None, False
+        value = read_probe()
+    elif value.get("status") == "unverified":
+        ready_expression = (
+            "value.status === 'unique' "
+            f"&& value.shortcode === {json.dumps(parts[1])} "
+            "&& typeof value.text === 'string' && value.text.trim().length > 0"
+        )
+        wait_stop_error: InstagramStopStateCheckError | None = None
+        try:
+            _run_json([
+                "cdp", "--browser-mode", "headed", "wait", "eval", probe,
+                "--ready-expr", ready_expression, "--target", target_id,
+                "--timeout", "1s", "--json",
+            ], runner)
+        except InstagramStopStateCheckError as exc:
+            wait_stop_error = exc
+        except RuntimeError:
+            # Timeout means the binding did not become ready within the bound;
+            # still reclassify and take one final read for unverified output.
+            pass
+        # Recheck on both matched and timed-out waits before any final DOM read.
+        _require_clear_stop_state(target_id, runner)
+        if wait_stop_error is not None:
+            raise wait_stop_error
+        value = read_probe()
+
     if not isinstance(value, dict):
-        raise RuntimeError("The visible reel caption probe returned an invalid result")
-    if value.get("status") == "ambiguous":
-        raise RuntimeError("The first reel video card had an ambiguous visible caption")
-    text = value.get("text")
-    if value.get("status") != "unique" or not isinstance(text, str) or not text.strip():
-        raise RuntimeError("No unique visible caption was available in the first reel video card")
-    return " ".join(text.split())[:MAX_POST_TEXT_CHARS]
+        return None, False
+    candidate_count = value.get("candidate_count")
+    if type(candidate_count) is not int or candidate_count < 1:
+        return None, False
+    caption = value.get("text")
+    if not isinstance(caption, str) or not caption.strip():
+        return None, False
+    caption = " ".join(caption.split())[:MAX_POST_TEXT_CHARS]
+    verified = value.get("status") == "unique" and value.get("shortcode") == parts[1]
+    return caption, verified
 
 
 def _single_post_metadata(target_id: str, runner: _Runner) -> tuple[str | None, str | None]:
@@ -293,6 +453,7 @@ def _require_clear_stop_state(target_id: str, runner: _Runner) -> None:
 
 def collect_visible_posts(
     url: str, *, runner: _Runner = subprocess.run, target_id: str | None = None,
+    include_metadata: bool = True,
 ) -> list[dict[str, str]]:
     """Collect visible post text from an exact, already-open page.
 
@@ -303,8 +464,10 @@ def collect_visible_posts(
     navigates a tab. Tag pages use visible ``article`` items;
     exact single-post/reel pages use one narrowly observed caption span and
     fail if it is empty or ambiguous. Returns bounded ``source_url``/``text``
-    records. Raises ``ValueError`` for an invalid URL and ``RuntimeError`` for
-    CDP failures, missing matching tabs, inaccessible content, or ambiguous text.
+    records. ``include_metadata=False`` suppresses separately queried date and
+    creator fields when provenance must stay bound to the caption read. Raises
+    ``ValueError`` for an invalid URL and ``RuntimeError`` for CDP failures,
+    missing matching tabs, inaccessible content, or ambiguous text.
     """
     _, host, path = _instagram_url(url)
     owned_target = target_id is not None
@@ -353,24 +516,44 @@ def collect_visible_posts(
     is_single_post = _is_single_post_path(path) or (
         owned_target and _is_owned_reels_path(page_path)
     )
-    used_reels_fallback = False
     if is_single_post:
         result = _run_json([
             "cdp", "--browser-mode", "headed", "text", _SINGLE_POST_TEXT_SELECTOR,
             "--target", target_id, "--limit", "2", "--json",
         ], runner)
         texts = _visible_texts(result)
-        if not texts and owned_target and _is_owned_reels_path(page_path):
-            texts = [_owned_reels_caption(target_id, runner)]
-            used_reels_fallback = True
-        if len(texts) != 1:
-            # Do not broaden selectors or inspect hidden app state at access walls.
-            message = (
-                "The visible post caption is ambiguous" if texts else
-                "No visible post caption was available; the page may require login or be unavailable"
+        path_parts = path.strip("/").split("/")
+        is_reel = (
+            len(path_parts) == 2 and path_parts[0] in {"reel", "reels"}
+        ) or _is_owned_reels_path(page_path)
+        if is_reel:
+            card_text, source_verified = _owned_reel_caption(path, target_id, runner)
+            if card_text:
+                # Reel text and permalink come from one evaluation. A lone span
+                # selector result is only an unverified compatibility fallback.
+                texts = [card_text]
+            elif len(texts) != 1:
+                message = (
+                    "The visible post caption is ambiguous" if texts else
+                    "No visible post caption was available; the page may require login or be unavailable"
+                )
+                raise RuntimeError(message)
+            posted_at, creator = None, None
+        else:
+            if len(texts) != 1:
+                # Do not broaden selectors or inspect hidden app state at access walls.
+                message = (
+                    "The visible post caption is ambiguous" if texts else
+                    "No visible post caption was available; the page may require login or be unavailable"
+                )
+                raise RuntimeError(message)
+            posted_at, creator = (
+                _single_post_metadata(target_id, runner)
+                if include_metadata else (None, None)
             )
-            raise RuntimeError(message)
-        posted_at, creator = (None, None) if used_reels_fallback else _single_post_metadata(target_id, runner)
+            source_verified = _has_verified_source_association(
+                path, texts[0], target_id, runner,
+            )
     else:
         snapshot = _run_json([
             "cdp", "--browser-mode", "headed", "snapshot", "--target", target_id,
@@ -382,6 +565,9 @@ def collect_visible_posts(
             raise RuntimeError("No visible Instagram articles were available; the page may require login or be unavailable")
     source_url = urlunsplit(("https", page_host, page_path, "", ""))
     records = [{"source_url": source_url, "text": text} for text in texts]
+    if is_single_post:
+        for record in records:
+            record["source_association"] = "verified" if source_verified else "unverified"
     if is_single_post and posted_at:
         records[0]["posted_at"] = posted_at
     if is_single_post and creator:

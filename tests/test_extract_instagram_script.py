@@ -43,7 +43,14 @@ def test_script_reads_one_visible_post_and_stops_on_access_wall(tmp_path):
     env = {**os.environ, "PATH": f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}"}
     result = _run(URL, env=env)
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout)["posts"] == [{"source_url": URL, "text": "A synthetic finance caption"}]
+    posts = json.loads(result.stdout)["posts"]
+    assert len(posts) == 1
+    assert posts[0]["source_url"] == URL
+    assert posts[0]["text"] == "A synthetic finance caption"
+    # The fake CDP response exposes caption text without a same-card permalink
+    # association probe, so the extractor must preserve the text while marking
+    # its source association honestly.
+    assert posts[0]["source_association"] == "unverified"
     blocked = _run(URL, env={**env, "TEST_BLOCKED": "1"})
     assert blocked.returncode == 1
     assert blocked.stdout == ""
