@@ -5,16 +5,21 @@ import logging
 import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime as real_datetime, timezone
 from types import SimpleNamespace
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 import pytest
+from socialrum import search_connector
 
 from socialrum.search_connector import (
+    MAX_ATTEMPTS,
     MAX_CANDIDATES,
+    MAX_READABLE_TARGET,
     MAX_SEARCH_CANDIDATES,
     _candidate_rows,
     _canonical_post_url,
+    _next_page_url,
     _run_json,
     _valid_creator,
     search_and_collect_public_posts,
@@ -739,3 +744,481 @@ def test_default_connector_search_has_no_time_filter_or_google_result_count_over
     assert "tbs" not in params
     assert "num" not in params
     assert result["index_time_filter"] is None
+
+
+def test_target_mode_follows_visible_next_and_counts_verified_reads():
+    commands = []
+    first = {"href": "https://www.instagram.com/reel/one/", "result_text": "one"}
+    second = {"href": "https://www.instagram.com/reel/two/", "result_text": "two"}
+
+    def runner(command, **_kwargs):
+        commands.append(command)
+        if "open" in command and "--new-tab=false" not in command:
+            return _response({"ok": True, "page": {"id": "owned-target"}})
+        if "eval" in command:
+            page_urls = [cmd[cmd.index("open") + 1] for cmd in commands
+                         if "open" in cmd and "--new-tab=false" in cmd
+                         and "google.com/search" in cmd[cmd.index("open") + 1]]
+            if page_urls and "start=" in page_urls[-1]:
+                rows = [second]
+            else:
+                initial_url = next(cmd[cmd.index("open") + 1] for cmd in commands
+                                   if "open" in cmd and "--new-tab=false" not in cmd)
+                query = parse_qs(urlsplit(initial_url).query)["q"][0]
+                href = "https://www.google.com/search?" + urlencode({"q": query, "start": "10"})
+                rows = [first, {"href": href, "anchor_text": "Next", "aria_label": "Next", "id": "pnnext"}]
+            return _response({"ok": True, "result": {"value": rows}})
+        if "stop-state" in command:
+            return _clear_stop_state()
+        if "close" in command:
+            return _response({"ok": True, "target_gone": True})
+        return _response({"ok": True})
+
+    result = search_and_collect_public_posts(
+        "coffee", runner=runner, target_readable=2, max_attempts=5,
+        collector=lambda url, **_kwargs: [{"source_url": url, "text": "caption",
+                                           "source_association": "verified"}],
+    )
+    assert result["pages_visited"] == 2
+    assert result["attempted_count"] == 2
+    assert result["readable_count"] == 2
+    assert result["stop_reason"] == "target_reached"
+
+
+def test_target_mode_excludes_source_mismatch_even_with_verified_marker():
+    def runner(command, **_kwargs):
+        if "open" in command and "--new-tab=false" not in command:
+            return _response({"ok": True, "page": {"id": "owned-target"}})
+        if "eval" in command:
+            return _response({"ok": True, "result": {"value": [
+                {"href": "https://www.instagram.com/reel/one/", "result_text": "snippet"},
+            ]}})
+        if "stop-state" in command:
+            return _clear_stop_state()
+        if "close" in command:
+            return _response({"ok": True, "target_gone": True})
+        return _response({"ok": True})
+
+    result = search_and_collect_public_posts(
+        "coffee", runner=runner, target_readable=2, max_attempts=3,
+        collector=lambda *_a, **_k: [{"source_url": "https://www.instagram.com/reel/other/",
+                                      "text": "caption", "source_association": "verified"}],
+    )
+    assert result["readable_count"] == 0
+    assert result["candidates"][0]["status"] == "unverified"
+    assert result["stop_reason"] == "no_more_results"
+
+
+def test_target_one_does_not_open_second_search_page():
+    commands = []
+
+    def runner(command, **_kwargs):
+        commands.append(command)
+        if "open" in command and "--new-tab=false" not in command:
+            return _response({"ok": True, "page": {"id": "owned-target"}})
+        if "eval" in command:
+            initial = next(cmd[cmd.index("open") + 1] for cmd in commands
+                           if "open" in cmd and "--new-tab=false" not in cmd)
+            query = parse_qs(urlsplit(initial).query)["q"][0]
+            return _response({"ok": True, "result": {"value": [
+                {"href": "https://www.instagram.com/reel/one/", "result_text": "one"},
+                {"href": "https://www.google.com/search?" + urlencode({"q": query, "start": "10"}),
+                 "anchor_text": "Next", "id": "pnnext"},
+            ]}})
+        if "stop-state" in command:
+            return _clear_stop_state()
+        if "close" in command:
+            return _response({"ok": True, "target_gone": True})
+        return _response({"ok": True})
+
+    result = search_and_collect_public_posts(
+        "coffee", runner=runner, target_readable=1,
+        collector=lambda url, **_kwargs: [{"source_url": url, "text": "caption",
+                                           "source_association": "verified"}],
+    )
+    assert result["readable_count"] == 1
+    assert result["pages_visited"] == 1
+    assert not any("start=10" in command for cmd in commands for command in cmd)
+
+
+def test_pagination_failure_returns_prior_readable_results():
+    commands = []
+
+    def runner(command, **_kwargs):
+        commands.append(command)
+        if "open" in command and "--new-tab=false" not in command:
+            return _response({"ok": True, "page": {"id": "owned-target"}})
+        if "open" in command and any("start=10" in arg for arg in command):
+            raise RuntimeError("synthetic page navigation failure")
+        if "eval" in command:
+            initial = next(cmd[cmd.index("open") + 1] for cmd in commands
+                           if "open" in cmd and "--new-tab=false" not in cmd)
+            query = parse_qs(urlsplit(initial).query)["q"][0]
+            return _response({"ok": True, "result": {"value": [
+                {"href": "https://www.instagram.com/reel/one/", "result_text": "one"},
+                {"href": "https://www.google.com/search?" + urlencode({"q": query, "start": "10"}),
+                 "anchor_text": "Next", "id": "pnnext"},
+            ]}})
+        if "stop-state" in command:
+            return _clear_stop_state()
+        if "close" in command:
+            return _response({"ok": True, "target_gone": True})
+        return _response({"ok": True})
+
+    result = search_and_collect_public_posts(
+        "coffee", runner=runner, target_readable=2, max_attempts=5,
+        collector=lambda url, **_kwargs: [{"source_url": url, "text": "caption",
+                                           "source_association": "verified"}],
+    )
+    assert result["readable_count"] == 1
+    assert result["candidates"][0]["status"] == "read"
+    assert result["stop_reason"] == "pagination_navigation_failed"
+
+
+def test_duplicate_only_page_does_not_skip_candidates_on_later_page():
+    commands = []
+    post_a = {"href": "https://www.instagram.com/reel/a/", "result_text": "a"}
+    post_b = {"href": "https://www.instagram.com/reel/b/", "result_text": "b"}
+
+    def runner(command, **_kwargs):
+        commands.append(command)
+        if "open" in command and "--new-tab=false" not in command:
+            return _response({"ok": True, "page": {"id": "owned-target"}})
+        if "eval" in command:
+            pages = [cmd[cmd.index("open") + 1] for cmd in commands
+                     if "open" in cmd and "--new-tab=false" in cmd
+                     and "google.com/search" in cmd[cmd.index("open") + 1]]
+            page_num = 0
+            if pages and "start=20" in pages[-1]:
+                page_num = 2
+            elif pages and "start=10" in pages[-1]:
+                page_num = 1
+            initial = next(cmd[cmd.index("open") + 1] for cmd in commands
+                           if "open" in cmd and "--new-tab=false" not in cmd)
+            query = parse_qs(urlsplit(initial).query)["q"][0]
+            if page_num == 0:
+                rows = [post_a]
+                start = 10
+            elif page_num == 1:
+                rows = [post_a]
+                start = 20
+            else:
+                rows = [post_b]
+                start = None
+            if start is not None:
+                rows.append({"href": "https://www.google.com/search?" + urlencode(
+                    {"q": query, "start": str(start)}), "anchor_text": "Next", "id": "pnnext"})
+            return _response({"ok": True, "result": {"value": rows}})
+        if "stop-state" in command:
+            return _clear_stop_state()
+        if "close" in command:
+            return _response({"ok": True, "target_gone": True})
+        return _response({"ok": True})
+
+    result = search_and_collect_public_posts(
+        "coffee", runner=runner, target_readable=2, max_attempts=5,
+        collector=lambda url, **_kwargs: [{"source_url": url, "text": "caption",
+                                           "source_association": "verified"}],
+    )
+    assert result["pages_visited"] == 3
+    assert result["attempted_count"] == 2
+    assert result["readable_count"] == 2
+    assert [item["source_url"] for item in result["candidates"]] == [
+        "https://www.instagram.com/reel/a/", "https://www.instagram.com/reel/b/",
+    ]
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"target_readable": 0}, {"target_readable": MAX_READABLE_TARGET + 1},
+    {"target_readable": True}, {"target_readable": 1, "max_attempts": MAX_ATTEMPTS + 1},
+])
+def test_target_and_attempt_bounds_are_strict(kwargs):
+    with pytest.raises(ValueError):
+        search_and_collect_public_posts("coffee", **kwargs)
+
+
+def test_target_mode_returns_partial_candidates_after_unavailable_then_boundary():
+    stop_calls = 0
+
+    def runner(command, **_kwargs):
+        nonlocal stop_calls
+        if "open" in command and "--new-tab=false" not in command:
+            return _response({"ok": True, "page": {"id": "owned-target"}})
+        if "eval" in command:
+            return _response({"ok": True, "result": {"value": [
+                {"href": "https://www.instagram.com/reel/one/", "result_text": "one"},
+                {"href": "https://www.instagram.com/reel/two/", "result_text": "two"},
+            ]}})
+        if "stop-state" in command:
+            stop_calls += 1
+            if stop_calls <= 3:
+                return _clear_stop_state()
+            return _response({"ok": True, "classification_ok": True, "status": "blocked",
+                              "agent_should_stop": True, "stop_state": "login_required",
+                              "target": {"id": "owned-target"}})
+        if "close" in command:
+            return _response({"ok": True, "target_gone": True})
+        return _response({"ok": True})
+
+    def collector(_url, **_kwargs):
+        raise RuntimeError("synthetic unavailable caption")
+
+    result = search_and_collect_public_posts(
+        "coffee", runner=runner, collector=collector, target_readable=2,
+    )
+    assert result["stop_reason"] == "login_required"
+    assert result["attempted_count"] == 2
+    assert [candidate["status"] for candidate in result["candidates"]] == [
+        "unavailable", "unavailable",
+    ]
+
+
+def test_next_page_must_preserve_google_time_filter():
+    current = "https://www.google.com/search?" + urlencode({"q": "coffee", "tbs": "qdr:d30"})
+    missing_filter = "https://www.google.com/search?" + urlencode({"q": "coffee", "start": "10"})
+    changed_filter = "https://www.google.com/search?" + urlencode(
+        {"q": "coffee", "start": "10", "tbs": "qdr:d7"})
+    for href in (missing_filter, changed_filter):
+        payload = {"result": {"value": [{"href": href, "id": "pnnext"}]}}
+        assert _next_page_url(payload, current) is None
+
+
+def test_target_serp_waits_for_visible_anchor_readiness_before_extracting():
+    commands = []
+
+    def runner(command, **_kwargs):
+        commands.append(command)
+        if "open" in command and "--new-tab=false" not in command:
+            return _response({"ok": True, "page": {"id": "owned-target"}})
+        if "eval" in command and "wait" in command:
+            return _response({"ok": True, "wait": {"ready": True}})
+        if "eval" in command:
+            return _response({"ok": True, "result": {"value": [
+                {"href": "https://www.instagram.com/reel/one/", "result_text": "one"},
+            ]}})
+        if "stop-state" in command:
+            return _clear_stop_state()
+        if "close" in command:
+            return _response({"ok": True, "target_gone": True})
+        return _response({"ok": True})
+
+    result = search_and_collect_public_posts(
+        "coffee", runner=runner, target_readable=1,
+        collector=lambda url, **_kwargs: [{"source_url": url, "text": "caption",
+                                           "source_association": "verified"}],
+    )
+    wait_command = next(cmd for cmd in commands if "wait" in cmd and "eval" in cmd)
+    assert wait_command[wait_command.index("--ready-expr") + 1] == "value >= 5"
+    assert wait_command[wait_command.index("--timeout") + 1] == "4s"
+    wait_index = commands.index(wait_command)
+    extraction_index = next(i for i, cmd in enumerate(commands)
+                            if "eval" in cmd and "wait" not in cmd)
+    assert wait_index < extraction_index
+    assert result["readable_count"] == 1
+
+
+def test_target_serp_wait_timeout_rechecks_stop_state_then_uses_available_rows():
+    stop_calls = 0
+
+    def runner(command, **_kwargs):
+        nonlocal stop_calls
+        if "open" in command and "--new-tab=false" not in command:
+            return _response({"ok": True, "page": {"id": "owned-target"}})
+        if "eval" in command and "wait" in command:
+            return _response({"ok": False, "code": "timeout",
+                              "data": {"wait": {"ready": False}}}, returncode=1)
+        if "eval" in command:
+            return _response({"ok": True, "result": {"value": [
+                {"href": "https://www.instagram.com/reel/one/", "result_text": "one"},
+            ]}})
+        if "stop-state" in command:
+            stop_calls += 1
+            return _clear_stop_state()
+        if "close" in command:
+            return _response({"ok": True, "target_gone": True})
+        return _response({"ok": True})
+
+    result = search_and_collect_public_posts(
+        "coffee", runner=runner, target_readable=1,
+        collector=lambda url, **_kwargs: [{"source_url": url, "text": "caption",
+                                           "source_association": "verified"}],
+    )
+    assert stop_calls >= 3  # initial page, after timed-out readiness, candidate page
+    assert result["readable_count"] == 1
+
+
+def test_target_serp_wait_reclassifies_boundary_before_extraction():
+    stop_calls = 0
+    extraction_calls = 0
+
+    def runner(command, **_kwargs):
+        nonlocal stop_calls, extraction_calls
+        if "open" in command and "--new-tab=false" not in command:
+            return _response({"ok": True, "page": {"id": "owned-target"}})
+        if "eval" in command and "wait" in command:
+            return _response({"ok": True, "wait": {"ready": True}})
+        if "eval" in command:
+            extraction_calls += 1
+            return _response({"ok": True, "result": {"value": []}})
+        if "stop-state" in command:
+            stop_calls += 1
+            if stop_calls == 1:
+                return _clear_stop_state()
+            return _response({"ok": True, "classification_ok": True, "status": "blocked",
+                              "agent_should_stop": True, "stop_state": "login_required",
+                              "target": {"id": "owned-target"}})
+        if "close" in command:
+            return _response({"ok": True, "target_gone": True})
+        return _response({"ok": True})
+
+    with pytest.raises(InstagramAccessBoundaryError):
+        search_and_collect_public_posts("coffee", runner=runner, target_readable=1)
+    assert extraction_calls == 0
+
+
+def test_result_keeps_searched_at_and_adds_run_start_end_timestamps(monkeypatch):
+    moments = iter([
+        real_datetime(2026, 11, 2, 10, 0, tzinfo=timezone.utc),
+        real_datetime(2026, 11, 2, 10, 1, tzinfo=timezone.utc),
+        real_datetime(2026, 11, 2, 10, 2, tzinfo=timezone.utc),
+    ])
+
+    class FixedDateTime:
+        @classmethod
+        def now(cls, tz=None):
+            return next(moments)
+
+    monkeypatch.setattr(search_connector, "datetime", FixedDateTime)
+
+    def runner(command, **_kwargs):
+        if "open" in command and "--new-tab=false" not in command:
+            return _response({"ok": True, "page": {"id": "owned-target"}})
+        if "stop-state" in command:
+            return _clear_stop_state()
+        if "eval" in command:
+            return _response({"ok": True, "result": {"value": []}})
+        if "close" in command:
+            return _response({"ok": True, "target_gone": True})
+        return _response({"ok": True})
+
+    result = search_and_collect_public_posts("coffee", runner=runner, target_readable=1)
+    assert result["started_at"] == "2026-11-02T10:00:00+00:00"
+    assert result["ended_at"] == "2026-11-02T10:01:00+00:00"
+    assert result["searched_at"] == "2026-11-02T10:02:00+00:00"
+
+
+def test_target_stops_at_explicit_page_ceiling():
+    commands = []
+
+    def runner(command, **_kwargs):
+        commands.append(command)
+        if "open" in command and "--new-tab=false" not in command:
+            return _response({"ok": True, "page": {"id": "owned-target"}})
+        if "eval" in command:
+            initial = next(cmd[cmd.index("open") + 1] for cmd in commands
+                           if "open" in cmd and "--new-tab=false" not in cmd)
+            query = parse_qs(urlsplit(initial).query)["q"][0]
+            return _response({"ok": True, "result": {"value": [
+                {"href": "https://www.instagram.com/reel/one/", "result_text": "one"},
+                {"href": "https://www.google.com/search?" + urlencode(
+                    {"q": query, "start": "10"}), "id": "pnnext"},
+            ]}})
+        if "stop-state" in command:
+            return _clear_stop_state()
+        if "close" in command:
+            return _response({"ok": True, "target_gone": True})
+        return _response({"ok": True})
+
+    result = search_and_collect_public_posts(
+        "coffee", runner=runner, target_readable=2, max_pages=1,
+        collector=lambda url, **_kwargs: [{"source_url": url, "text": "caption",
+                                           "source_association": "verified"}],
+    )
+    assert result["pages_visited"] == 1
+    assert result["readable_count"] == 1
+    assert result["stop_reason"] == "page_ceiling"
+    assert not any("start=10" in arg for command in commands for arg in command)
+
+
+def test_target_stops_at_elapsed_time_ceiling_before_next_page():
+    commands = []
+    clock_values = iter([0.0, 0.0, 2.0, 2.0])
+
+    def runner(command, **_kwargs):
+        commands.append(command)
+        if "open" in command and "--new-tab=false" not in command:
+            return _response({"ok": True, "page": {"id": "owned-target"}})
+        if "eval" in command:
+            return _response({"ok": True, "result": {"value": [
+                {"href": "https://www.instagram.com/reel/one/", "result_text": "one"},
+            ]}})
+        if "stop-state" in command:
+            return _clear_stop_state()
+        if "close" in command:
+            return _response({"ok": True, "target_gone": True})
+        return _response({"ok": True})
+
+    result = search_and_collect_public_posts(
+        "coffee", runner=runner, target_readable=2, max_elapsed_seconds=1,
+        clock=lambda: next(clock_values),
+        collector=lambda url, **_kwargs: [{"source_url": url, "text": "caption",
+                                           "source_association": "verified"}],
+    )
+    assert result["readable_count"] == 1
+    assert result["stop_reason"] == "time_ceiling"
+    assert result["elapsed_seconds"] == 2.0
+
+
+def test_target_progress_is_monotonic_and_counts_only_verified_reads():
+    snapshots = []
+
+    def runner(command, **_kwargs):
+        if "open" in command and "--new-tab=false" not in command:
+            return _response({"ok": True, "page": {"id": "owned-target"}})
+        if "eval" in command:
+            return _response({"ok": True, "result": {"value": [
+                {"href": "https://www.instagram.com/reel/one/", "result_text": "one"},
+                {"href": "https://www.instagram.com/reel/two/", "result_text": "two"},
+            ]}})
+        if "stop-state" in command:
+            return _clear_stop_state()
+        if "close" in command:
+            return _response({"ok": True, "target_gone": True})
+        return _response({"ok": True})
+
+    def collector(url, **_kwargs):
+        association = "verified" if url.endswith("one/") else "unverified"
+        return [{"source_url": url, "text": "caption", "source_association": association}]
+
+    result = search_and_collect_public_posts(
+        "coffee", runner=runner, collector=collector, target_readable=2,
+        progress_callback=snapshots.append,
+    )
+    assert [snapshot["attempted_count"] for snapshot in snapshots] == [1, 2]
+    assert [snapshot["readable_count"] for snapshot in snapshots] == [1, 1]
+    assert all(snapshot["target_readable"] == 2 for snapshot in snapshots)
+    assert result["readable_count"] == 1
+
+
+def test_progress_callback_failure_does_not_interrupt_collection():
+    def runner(command, **_kwargs):
+        if "open" in command and "--new-tab=false" not in command:
+            return _response({"ok": True, "page": {"id": "owned-target"}})
+        if "eval" in command:
+            return _response({"ok": True, "result": {"value": [
+                {"href": "https://www.instagram.com/reel/one/", "result_text": "one"},
+            ]}})
+        if "stop-state" in command:
+            return _clear_stop_state()
+        if "close" in command:
+            return _response({"ok": True, "target_gone": True})
+        return _response({"ok": True})
+
+    result = search_and_collect_public_posts(
+        "coffee", runner=runner, target_readable=1,
+        collector=lambda url, **_kwargs: [{"source_url": url, "text": "caption",
+                                           "source_association": "verified"}],
+        progress_callback=lambda _snapshot: (_ for _ in ()).throw(RuntimeError("UI closed")),
+    )
+    assert result["readable_count"] == 1
+    assert result["stop_reason"] == "target_reached"
