@@ -42,20 +42,46 @@ The direct public finance hashtag page tested separately still returned a login 
 
 ### Search and collect public posts
 
-For user-initiated discovery, send `extract #finance` or `extract personal finance`. This opens a Google search in the headed browser, reads visible result links, and attempts to collect visible text from at most five public Instagram post/reel candidates. It does not query Instagram's live search. The existing `find #finance` or `find personal finance` command remains the link-only option: it creates a Google search link for you to open and does not run the search or read results.
+For the legacy five-candidate flow, send `extract #finance` or `extract personal finance`. It searches visible Google results and attempts to read up to five Instagram post/reel candidates. It does not query Instagram's live search. The existing `find #finance` or `find personal finance` command remains the link-only option: it creates a Google search link for you to open and does not run the search or read results.
 
-#### Terminal reel search (up to 20)
+#### Separate readable-reel collection
 
-To search Google for reel candidates directly from a terminal on the machine
-with the headed browser and `cdp` on `PATH`, use:
+The new `collect` workflow has a readable-record target, separate from the five-candidate `extract` flow. In Chainlit, click **Collect reels**, enter a phrase or hashtag, and choose a target from 1–50 (blank means 25). Or use a command directly:
 
-```bash
-python3 scripts/search_instagram_posts.py '#education' --reels-only --recent-days 30 --limit 20
+```text
+collect #education
+collect personal finance --target 40
 ```
 
-Replace `#education` with a hashtag or phrase, such as `'personal finance'`. The `--reels-only` flag limits discovery to reels; without it, terminal searches use the default mixed post/reel mode. `--recent-days 30` applies a Google index date filter for approximately the last 30 days; it is not verified Instagram publication-date filtering. The command attempts to read up to 20 reel candidates. Google may return fewer than 20 candidates, and its index filter cannot guarantee publication dates, recency, or that results are the latest reels. When an Instagram `/reel/<id>` URL redirects to `/reels/<id>`, the fallback reader uses the first visible reel/video card. That heuristic assumes the first visible video is the requested reel and cannot guarantee source matching; returned captions may be truncated. A visible or indexed date is not verified as the reel's publication date. The command prints JSON to the terminal without saving a file, checks for access walls, stops when a boundary is encountered, and closes its own browser tab. Individual candidates can be unavailable. The exit code is 0 for a completed run, 1 for a failure before results, and 2 when a run stops early with partial JSON. The script does not verify authorization, browser sign-in state, or whether a candidate is publicly accessible. Follow Meta's policies and only collect content you are permitted to access this way. A signed-in browser does not establish that a page is public or authorize automated collection. If an access wall appears, the script stops; it does not bypass the wall. The JSON may contain visible post text and unverified Google snippets; handle it accordingly. Its `sample_summary` separates the number of Google-result candidates from the number successfully read with nonempty visible text, then reports literal visible-text matches as a count out of readable text. Matching uses the existing case-insensitive, whole-word phrase rules; for a hashtag query such as `#education`, the literal `#education` must appear in collected post text, and plain `education` alone does not match. Snippets and URLs do not contribute to this count. A snippet-only hit is not evidence that a reel was read or matched. These are bounded sample counts, not platform totals, a real-time Instagram search, or trend measurements.
+`--target N` and `--target-readable N` are accepted by the Chainlit command. Target means unique reels with nonempty visible caption text **and verified caption-to-requested-reel association**. A readable but unverified/ambiguous association is excluded from the target count. The run may return fewer records; the UI reports the target, collected count, attempts and stop reason. Only one public search runs at a time in the app process. A request submitted while one is running is rejected, not queued.
 
-The Chainlit `extract` workflow remains separately bounded to at most five candidates. This terminal command does not change that app limit.
+From a terminal, run the separate collector on the machine where the local headed browser and `cdp` CLI are available:
+
+```bash
+python3 scripts/search_instagram_posts.py '#education' --target-readable 25
+```
+
+The phrase/hashtag is positional. Reel-only discovery is the default. Use `--include-posts` to opt into a mixed post/reel sample; `--reels-only` remains accepted explicitly. Supported controls and defaults are:
+
+| Flag | Default | Bounds / meaning |
+|---|---:|---|
+| `--target-readable N` | 25 | 1–50 unique, nonempty records with verified source association; may return fewer |
+| `--max-attempts N` | 100 | 1–100 unique candidate read attempts; `--limit` remains a compatibility alias for this attempt bound, not the readable target |
+| `--max-pages N` | 10 | 1–10 visible Google result pages |
+| `--time-budget-seconds N` | 600 | 1–600 seconds; soft deadline checked between operations, not a hard wall-clock cap |
+| `--reels-only` | on | Explicitly request reel-only candidate discovery; this is already the default. |
+| `--include-posts` | off | Include Instagram post URLs alongside reels for a mixed sample. |
+| `--recent-days D` | unset | 1–365 day filter requested from Google; not a verified Instagram publication-date filter |
+
+The JSON output keeps candidate text, snippets, attempts, readable count, pages visited, elapsed time and `stop_reason` separate. Depending on the stop, the reason can be `target_reached`, `attempt_ceiling`, `time_ceiling`, `no_more_results`, or an access/navigation failure. The 600-second time budget is a soft deadline checked between operations; an in-flight CDP/browser operation can continue past it, so it is not a hard wall-clock guarantee. Already collected results are retained when the run stops early. The CLI prints JSON to stdout and does not save a file. Exit status is 0 when the requested readable target is met, 2 when JSON is returned but the target is short, and 1 when the search fails before returning a result. Do not interpret candidate count as readable count or the target as a guarantee.
+
+Discovery is through Google-indexed results, not Instagram live search. Google can omit, rank, or retain pages unevenly, so the sample may be stale or incomplete. `--recent-days` filters Google's index results; it does not verify publication dates or freshness. Snippets are unverified search context and never count as caption text or keyword matches. Keyword matches use visible text collected from the Instagram page only. A source association that cannot be verified is not counted toward the target. These bounded observations are not platform totals, a representative sample, popularity ranking, real-time feed, or trend measurement.
+
+The local headed browser and reader may encounter unavailable pages or access boundaries. The app cannot verify authorization or whether the browser is logged out. Use only content you are authorized to access. If a login/access wall, challenge, or consent boundary appears, stop; the workflow does not bypass it. A signed-in browser session does not establish authorization. The terminal workflow closes its owned browser tab after completion where cleanup is confirmed.
+
+The Chainlit `extract` flow remains separately capped at five candidates; `collect` does not silently expand that legacy behavior.
+
+The Chainlit `extract` workflow remains separately bounded to at most five candidates. `collect` is the distinct target-based path.
 
 Google's index can be stale or incomplete and may omit, rank, or retain pages unevenly. Extraction failures are reported per candidate; one unavailable page does not discard other candidates that were read. The report shows the readable-page count (for example, `2 of 5 candidates`), each candidate's source and collection status, and the first 1,000 characters of collected post/caption text. A visible post date is shown when available. Google search snippets are labeled as unverified context and are kept separate: snippets do not count as post text and are excluded from keyword matching or draft suggestions. Matching uses only text actually collected from the Instagram page. Results are not an exhaustive search, current trend report, popularity ranking, or representative sample.
 
