@@ -1,0 +1,83 @@
+/* Small readability refinements that preserve Chainlit's selected theme. */
+.prose {
+  line-height: 1.65;
+}
+
+.prose h1 {
+  margin-bottom: 0.7rem;
+  font-size: 1.65rem;
+  letter-spacing: -0.025em;
+}
+
+.prose h2 {
+  margin-top: 1.35rem;
+  margin-bottom: 0.45rem;
+  font-size: 1.15rem;
+  letter-spacing: -0.01em;
+}
+
+.prose h3 {
+  margin-top: 1rem;
+  font-size: 1rem;
+}
+
+.prose p,
+.prose li {
+  line-height: 1.65;
+}
+
+.prose code {
+  padding: 0.1em 0.3em;
+  border-radius: 0.3rem;
+}
+
+:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 3px;
+}
+
+/* Chainlit puts chat before its element sidebar in the horizontal panel group.
+   Reverse that order on desktop so the guide stays beside chat on the left. */
+@media (min-width: 768px) {
+  [data-panel-group][data-panel-group-direction="horizontal"]:has(#side-view-content) {
+    flex-direction: row-reverse !important;
+  }
+}
+
+#side-view-title {
+  gap: 0.5rem;
+  padding-bottom: 0.75rem;
+}
+
+#side-view-content {
+  padding-top: 0.25rem;
+  padding-bottom: 1rem;
+}
+
+#side-view-content .prose {
+  font-size: 0.92rem;
+  line-height: 1.55;
+}
+
+#side-view-content .prose h2 {
+  margin-top: 0.5rem;
+  margin-bottom: 0.6rem;
+  font-size: 1.1rem;
+}
+
+#side-view-content .prose h3 {
+  margin-top: 1rem;
+  margin-bottom: 0.3rem;
+  font-size: 0.9rem;
+}
+
+#side-view-content .prose p {
+  margin-top: 0.35rem;
+  margin-bottom: 0.65rem;
+}
+
+#side-view-content pre,
+#side-view-content code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
