@@ -511,8 +511,170 @@ def test_generic_extract_prompt_accepts_hashtag_or_phrase():
     assert "up to five" in INSTAGRAM_KEYWORD_PROMPT
 
 
+def test_target_collection_renderer_shows_attempts_readable_shortfall_and_stop_reason():
+    rendered = app._render_instagram_extraction({
+        "query": "finance query",
+        "searched_at": "2026-11-01T00:00:00+00:00",
+        "attempted_count": 8,
+        "readable_count": 3,
+        "stop_reason": "no_more_results",
+        "candidates": [
+            {"source_url": f"https://www.instagram.com/reel/{i}/", "status": "read", "source_association": "verified", "post_text": f"finance tip {i}"}
+            for i in range(3)
+        ] + [{"source_url": f"https://www.instagram.com/reel/{i}/", "status": "unavailable"} for i in range(3, 8)],
+    }, "finance", target_readable=25)
+
+    assert "Instagram reel collection" in rendered
+    assert "Target:** 25 readable reels; **collected:** 3" in rendered
+    assert r"Candidate attempts:** 8; **stop reason:** no\_more\_results" in rendered
+    assert "Partial result:** returned 3 of 25 requested readable reels" in rendered
+    assert "### Candidate 8" in rendered
+
+
+def test_target_renderer_excludes_read_status_without_verified_source_from_counts_and_signals():
+    rendered = app._render_instagram_extraction({
+        "query": "finance",
+        "attempted_count": 2,
+        # Deliberately contradict the candidate evidence to prove the renderer
+        # derives its readable total from verified records.
+        "readable_count": 2,
+        "candidates": [
+            {
+                "source_url": "https://www.instagram.com/reel/ambiguous/",
+                "status": "read",
+                "source_association": "unverified",
+                "post_text": "finance caption #wrongsource",
+            },
+            {
+                "source_url": "https://www.instagram.com/reel/verified/",
+                "status": "read",
+                "source_association": "verified",
+                "post_text": "finance caption #verifiedsource",
+            },
+        ],
+    }, "finance", target_readable=25)
+
+    assert "Readable post pages:** 1 of 2 candidates" in rendered
+    assert "Target:** 25 readable reels; **collected:** 1" in rendered
+    assert "Visible-text matches for finance:** 1 of 1 readable posts" in rendered
+    assert "Source association:** unverified; visible caption text was found" in rendered
+    assert "finance caption \\#wrongsource" not in rendered
+    assert "#wrongsource" not in rendered
+    assert "wrongsource" not in rendered
+    assert r"**\#verifiedsource** — 1 of 1 readable posts" in rendered
+
+
+def test_target_collection_rejects_out_of_range_without_search(monkeypatch):
+    messages = []
+
+    class Message:
+        def __init__(self, content):
+            self.content = content
+
+        async def send(self):
+            messages.append(self.content)
+
+    monkeypatch.setattr(app.cl, "Message", Message)
+    monkeypatch.setattr(app, "search_and_collect_public_posts", lambda *_a, **_k: pytest.fail("must not search"))
+
+    asyncio.run(app._send_instagram_target_collection("#finance", 51))
+
+    assert "whole number from 1 to 50" in messages[0]
+
+
+def test_target_collection_calls_new_connector_contract_and_keeps_legacy_extract_separate(monkeypatch):
+    messages = []
+    updates = []
+    progress_updated = asyncio.Event()
+    calls = []
+
+    class Session:
+        def __init__(self):
+            self.values = {}
+
+        def get(self, key):
+            return self.values.get(key)
+
+        def set(self, key, value):
+            self.values[key] = value
+
+    class Message:
+        def __init__(self, content):
+            self.content = content
+
+        async def send(self):
+            messages.append(self.content)
+
+        async def update(self):
+            updates.append(self.content)
+            progress_updated.set()
+
+    class ImmediateFuture:
+        def add_done_callback(self, callback):
+            callback(self)
+
+    def submit(fn, *args, **kwargs):
+        calls.append((fn, args, kwargs))
+        return ImmediateFuture()
+
+    async def wrap_future(_future):
+        progress_callback = calls[0][2]["progress_callback"]
+        progress_callback({
+            "attempted_count": 1, "readable_count": 1,
+            "target_readable": 25, "pages_visited": 1,
+        })
+        await asyncio.wait_for(progress_updated.wait(), timeout=1)
+        return {
+            "query": "finance", "searched_at": "now",
+            "candidates": [{
+                "source_url": "https://www.instagram.com/reel/one/",
+                "status": "read", "source_association": "verified",
+                "post_text": "finance caption",
+            }],
+            "attempted_count": 1, "readable_count": 1, "stop_reason": "target_reached",
+        }
+
+    monkeypatch.setattr(app.cl, "user_session", Session())
+    monkeypatch.setattr(app.cl, "Message", Message)
+    monkeypatch.setattr(app._PUBLIC_SEARCH_EXECUTOR, "submit", submit)
+    monkeypatch.setattr(app.asyncio, "wrap_future", wrap_future)
+
+    asyncio.run(app._send_instagram_target_collection("#finance"))
+
+    assert calls[0][0] is app.search_and_collect_public_posts
+    assert calls[0][1] == ("#finance",)
+    assert calls[0][2]["target_readable"] == 25
+    assert calls[0][2]["reels_only"] is True
+    assert callable(calls[0][2]["progress_callback"])
+    assert "target of **25 readable records**" in messages[0]
+    assert "candidate attempts: **1**" in updates[0]
+    assert "verified readable: **1 / 25**" in updates[0]
+    assert "search pages visited: **1**" in updates[0]
+    assert r"stop reason: **target\_reached**" in updates[-1]
+    completed_update_count = len(updates)
+    calls[0][2]["progress_callback"]({
+        "attempted_count": 99, "readable_count": 25,
+        "target_readable": 25, "pages_visited": 10,
+    })
+    assert len(updates) == completed_update_count
+
+
+def test_legacy_extraction_renderer_remains_five_candidate_limited():
+    result = {"candidates": [
+        {"source_url": f"https://www.instagram.com/p/{i}/", "status": "unavailable"}
+        for i in range(8)
+    ]}
+
+    rendered = _render_instagram_extraction(result, "finance")
+
+    assert "at most five candidates" in rendered
+    assert "### Candidate 5" in rendered
+    assert "### Candidate 6" not in rendered
+
+
 def test_welcome_prioritizes_real_topic_extraction_over_synthetic_demo():
-    assert WELCOME_MESSAGE.index("Search a topic") < WELCOME_MESSAGE.index("synthetic demo")
+    assert WELCOME_MESSAGE.index("Collect reels") < WELCOME_MESSAGE.index("synthetic demo")
+    assert "five-candidate" in WELCOME_MESSAGE
     assert "extract #finance" in WELCOME_MESSAGE
     assert "extract personal finance" in WELCOME_MESSAGE
     assert "not a trend or popularity report" in WELCOME_MESSAGE
@@ -798,6 +960,97 @@ def test_cancelled_search_keeps_admission_until_worker_finishes(monkeypatch):
         release.set()
 
     assert calls == ["running", "after-worker"]
+    assert any("new request was not queued" in message for message in messages)
+
+
+def test_cancelled_target_collection_keeps_slot_and_ignores_late_progress(monkeypatch):
+    started = threading.Event()
+    emit_late_progress = threading.Event()
+    late_progress_emitted = threading.Event()
+    release_worker = threading.Event()
+    calls = []
+    messages = []
+    updates = []
+
+    class Session:
+        def __init__(self):
+            self.values = {}
+
+        def get(self, key):
+            return self.values.get(key)
+
+        def set(self, key, value):
+            self.values[key] = value
+
+    class Message:
+        def __init__(self, content):
+            self.content = content
+
+        async def send(self):
+            messages.append(self.content)
+
+        async def update(self):
+            updates.append(self.content)
+
+    def fake_target_search(terms, *, target_readable, reels_only, progress_callback):
+        calls.append(terms)
+        assert target_readable == 25
+        assert reels_only is True
+        if terms == "first":
+            started.set()
+            if not emit_late_progress.wait(timeout=5):
+                raise RuntimeError("test did not authorize the late progress callback")
+            progress_callback({
+                "attempted_count": 1, "readable_count": 0,
+                "target_readable": 25, "pages_visited": 1,
+            })
+            late_progress_emitted.set()
+            if not release_worker.wait(timeout=5):
+                raise RuntimeError("test worker release timed out")
+        return {
+            "query": terms, "searched_at": "now", "candidates": [],
+            "attempted_count": 0, "readable_count": 0, "stop_reason": "no_results",
+        }
+
+    monkeypatch.setattr(app.cl, "user_session", Session())
+    monkeypatch.setattr(app.cl, "Message", Message)
+    monkeypatch.setattr(app, "search_and_collect_public_posts", fake_target_search)
+
+    async def exercise_cancelled_target():
+        task = asyncio.create_task(app._send_instagram_target_collection("first"))
+        assert await asyncio.wait_for(asyncio.to_thread(started.wait, 5), timeout=6)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("the target collection coroutine should propagate cancellation")
+
+        await app._send_instagram_target_collection("during-cancelled-worker")
+        assert calls == ["first"]
+        assert app._PUBLIC_SEARCH_ADMISSION.locked()
+
+        emit_late_progress.set()
+        assert await asyncio.wait_for(asyncio.to_thread(late_progress_emitted.wait, 5), timeout=6)
+        await asyncio.sleep(0.05)
+        assert not any("candidate attempts: **1**" in update for update in updates)
+
+        release_worker.set()
+        for _ in range(500):
+            if not app._PUBLIC_SEARCH_ADMISSION.locked():
+                break
+            await asyncio.sleep(0.01)
+        assert not app._PUBLIC_SEARCH_ADMISSION.locked()
+        await app._send_instagram_target_collection("after-worker")
+
+    try:
+        asyncio.run(exercise_cancelled_target())
+    finally:
+        emit_late_progress.set()
+        release_worker.set()
+
+    assert calls == ["first", "after-worker"]
     assert any("new request was not queued" in message for message in messages)
 
 

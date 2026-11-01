@@ -51,10 +51,11 @@ _PUBLIC_SEARCH_EXECUTOR = ThreadPoolExecutor(
     max_workers=1, thread_name_prefix="socialrum-public-search"
 )
 INSTAGRAM_KEYWORD_PROMPT = "Enter one hashtag (for example, #finance) or a phrase (for example, personal finance). The app will search visible Google results and try to read up to five public post/reel pages. Use only public content you are authorized to access; the app does not verify authorization or guarantee the headed browser is logged out."
+REEL_COLLECTION_PROMPT = "Enter one hashtag (for example, #finance) or a keyword phrase (for example, personal finance). This starts a separate bounded collection targeting 25 readable reels by default; results may be fewer."
 PUBLIC_SEARCH_GENERATION_KEY = "socialrum_public_search_generation"
 WELCOME_MESSAGE = (
     "# SocialRum Lab\n"
-    "Click **Search a topic** or send `extract #finance` / `extract personal finance` to search Google’s visible index and attempt to read up to five public post/reel pages. "
+    "Click **Collect reels** or send `collect #finance` / `collect personal finance` to target 25 readable reel records (up to 50). Send `extract #finance` / `extract personal finance` for the separate legacy five-candidate flow. "
     "Results may be stale or incomplete and are not a trend or popularity report. Use only public content you are authorized to access; the app does not verify authorization or guarantee a logged-out browser.\n\n"
     "You can also analyze a CSV or try the secondary synthetic demo. Nothing is published."
 )
@@ -338,24 +339,27 @@ def _render_instagram_search(result: dict) -> str:
     ])
 
 
-def _render_instagram_extraction(result: dict, keywords: str) -> str:
+def _render_instagram_extraction(result: dict, keywords: str, *, target_readable: int | None = None) -> str:
     """Render separately sourced search snippets and visible post text."""
     effective_phrase = normalize_instagram_phrase(keywords)
     raw_normalized_terms = " ".join(keywords.split()).casefold()
     capture_terms = " ".join(keywords.split())
     phrase_was_normalized = effective_phrase.casefold() != raw_normalized_terms
+    target_mode = target_readable is not None
     lines = [
-        "## Instagram post candidates",
-        "This is a best-effort sample of at most five candidates from visible Google results. The index may be stale or incomplete; this is not a live Instagram search, popularity ranking, or trend report.",
+        "## Instagram reel collection" if target_mode else "## Instagram post candidates",
+        (f"This bounded collection targeted {target_readable} readable records (maximum 50) and may return fewer. The index may be stale or incomplete; this is not a live Instagram search, popularity ranking, or trend report."
+         if target_mode else "This is a best-effort sample of at most five candidates from visible Google results. The index may be stale or incomplete; this is not a live Instagram search, popularity ranking, or trend report."),
         "Google snippets are shown only as search-result context. Keyword matches and draft suggestions below use visible text collected from the Instagram post page, never the search snippet.",
         "Use only public posts you are authorized to access. The app does not verify authorization or guarantee that the headed browser is logged out.",
     ]
     candidates = result.get("candidates") or []
-    sampled_candidates = candidates[:5]
+    sampled_candidates = candidates[:100] if target_mode else candidates[:5]
     readable_candidates = [
         candidate for candidate in sampled_candidates
         if isinstance(candidate, dict) and candidate.get("status") == "read"
         and isinstance(candidate.get("post_text"), str) and candidate["post_text"].strip()
+        and (not target_mode or candidate.get("source_association") == "verified")
     ]
     readable_count = len(readable_candidates)
     match_count = 0
@@ -391,6 +395,18 @@ def _render_instagram_extraction(result: dict, keywords: str) -> str:
         f"- **Readable post pages:** {readable_count} of {candidate_count} candidates.",
         f"- **Observed dates:** {dated_count} of {readable_count} readable posts.",
     ])
+    if target_mode:
+        attempted = result.get("attempted_count", candidate_count)
+        # Recompute from candidate evidence so renderer totals cannot include
+        # any caption whose source association is missing or unverified.
+        reported_readable = readable_count
+        stop_reason = result.get("stop_reason") or "not reported"
+        lines.extend([
+            f"- **Target:** {target_readable} readable reels; **collected:** {_md(reported_readable)}.",
+            f"- **Candidate attempts:** {_md(attempted)}; **stop reason:** {_md(stop_reason)}.",
+        ])
+        if isinstance(reported_readable, int) and reported_readable < target_readable:
+            lines.append(f"- **Partial result:** returned {_md(reported_readable)} of {target_readable} requested readable reels.")
     if phrase_was_normalized:
         lines.extend([
             f"- **Input as entered:** {_md(keywords)}",
@@ -412,7 +428,11 @@ def _render_instagram_extraction(result: dict, keywords: str) -> str:
         if candidate.get("search_result_text"):
             lines.append(f"- **Google search snippet (unverified):** {_md(candidate['search_result_text'])}")
         post_text = candidate.get("post_text")
-        if status == "read" and isinstance(post_text, str) and post_text.strip():
+        association_verified = candidate.get("source_association") == "verified"
+        has_visible_text = isinstance(post_text, str) and bool(post_text.strip())
+        if target_mode and has_visible_text and not association_verified:
+            lines.append("- **Source association:** unverified; visible caption text was found, but it cannot be attributed to this reel and is excluded from counts and analysis.")
+        elif status == "read" and has_visible_text and (not target_mode or association_verified):
             lines.append("- **Collected visible post/caption text (first 1,000 characters):**")
             lines.append(f"  - {_md(post_text[:1_000])}")
             if len(post_text) > 1_000:
@@ -449,9 +469,18 @@ def _render_instagram_extraction(result: dict, keywords: str) -> str:
             lines.append("- Search-result text was not treated as a collected post.")
         else:
             lines.append("- No visible post text was collected; search-result text was not treated as a post.")
-    # The signal helper inspects only status=read post_text fields and needs
-    # every candidate to calculate the correct readable/candidate denominator.
-    signal_result = analyze_topic_signals(candidates, effective_phrase)
+    # In target mode, only verified source associations are eligible signals.
+    # Preserve every row so the helper's candidate denominator remains correct.
+    signal_candidates = candidates
+    if target_mode:
+        signal_candidates = [
+            ({**candidate, "status": "unverified"}
+             if isinstance(candidate, dict)
+             and candidate.get("source_association") != "verified"
+             else candidate)
+            for candidate in candidates
+        ]
+    signal_result = analyze_topic_signals(signal_candidates, effective_phrase)
     lines.extend([
         "",
         "## Co-occurring hashtags in readable posts",
@@ -466,7 +495,14 @@ def _render_instagram_extraction(result: dict, keywords: str) -> str:
         if signal_result["truncated"]:
             lines.append("- Top 10 shown; additional co-occurring hashtags were omitted.")
     elif signal_result["read_post_count"] == 0:
-        lines.append("- No signals computed because no post text was readable.")
+        if target_mode and any(
+            isinstance(candidate, dict) and candidate.get("post_text")
+            and candidate.get("source_association") != "verified"
+            for candidate in candidates
+        ):
+            lines.append("- No signals computed because the available caption text had unverified source associations.")
+        else:
+            lines.append("- No signals computed because no post text was readable.")
     else:
         lines.append("- No co-occurring hashtags were present in the readable post text after excluding the searched hashtag, if specified.")
     lines.append(_md(signal_result["data_note"]))
@@ -643,6 +679,136 @@ async def _send_instagram_extraction(keywords: str) -> None:
             result.get("candidates") or [], normalize_instagram_phrase(keywords)
         ),
     })
+
+
+async def _send_instagram_target_collection(keywords: str, target_readable: int = 25) -> None:
+    """Run the separate readable-reel workflow; leave legacy `extract` bounded at five."""
+    if not isinstance(target_readable, int) or isinstance(target_readable, bool) or not 1 <= target_readable <= 50:
+        await cl.Message(content="Readable reel target must be a whole number from 1 to 50.").send()
+        return
+    if not keywords.strip():
+        await cl.Message(content="Enter a hashtag or keyword phrase before collecting reels.").send()
+        return
+    if not _PUBLIC_SEARCH_ADMISSION.acquire(blocking=False):
+        await cl.Message(content="A public post search is already running. Wait for its result or failure before starting another; the new request was not queued.").send()
+        return
+    loop = asyncio.get_running_loop()
+    progress_queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=1)
+    progress_active = threading.Event()
+    progress_active.set()
+    progress_message = cl.Message(content=(
+        f"Collecting reels for **{_md(keywords)}** with a target of **{target_readable} readable records**. "
+        "This may take several minutes. I’ll report candidate attempts, readable records, and any shortfall when the bounded search finishes."
+    ))
+
+    def enqueue_progress(snapshot: dict) -> None:
+        if not progress_active.is_set():
+            return
+        if progress_queue.full():
+            try:
+                progress_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        progress_queue.put_nowait(snapshot)
+
+    def report_progress(snapshot: dict) -> None:
+        if not progress_active.is_set() or not isinstance(snapshot, dict):
+            return
+        try:
+            loop.call_soon_threadsafe(enqueue_progress, dict(snapshot))
+        except RuntimeError:
+            # The chat loop may already be shutting down after cancellation.
+            progress_active.clear()
+
+    async def update_progress_message() -> None:
+        last_update = 0.0
+        try:
+            while progress_active.is_set():
+                snapshot = await progress_queue.get()
+                while not progress_queue.empty():
+                    snapshot = progress_queue.get_nowait()
+                delay = max(0.0, last_update + 1.0 - loop.time())
+                if delay:
+                    await asyncio.sleep(delay)
+                if not progress_active.is_set():
+                    return
+                attempted = snapshot.get("attempted_count", 0)
+                readable = snapshot.get("readable_count", 0)
+                pages = snapshot.get("pages_visited", 0)
+                progress_message.content = (
+                    f"Collecting reels for **{_md(keywords)}** · "
+                    f"candidate attempts: **{_md(attempted)}** · "
+                    f"verified readable: **{_md(readable)} / {target_readable}** · "
+                    f"search pages visited: **{_md(pages)}**."
+                )
+                await progress_message.update()
+                last_update = loop.time()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Could not update reel collection progress message", exc_info=True)
+
+    progress_task = asyncio.create_task(update_progress_message())
+    try:
+        generation = _begin_public_search()
+        cl.user_session.set("socialrum_latest_public_search", None)
+        await progress_message.send()
+        worker_future = _PUBLIC_SEARCH_EXECUTOR.submit(
+            search_and_collect_public_posts, keywords,
+            target_readable=target_readable, reels_only=True,
+            progress_callback=report_progress,
+        )
+    except BaseException:
+        progress_active.clear()
+        progress_task.cancel()
+        await asyncio.gather(progress_task, return_exceptions=True)
+        _PUBLIC_SEARCH_ADMISSION.release()
+        raise
+    worker_future.add_done_callback(lambda _future: _PUBLIC_SEARCH_ADMISSION.release())
+    try:
+        result = await asyncio.wrap_future(worker_future)
+    except (ValueError, RuntimeError) as exc:
+        await cl.Message(content=f"Could not complete reel collection: {_md(exc)}").send()
+        return
+    except Exception:
+        logger.exception("Unexpected Instagram target collection failure")
+        await cl.Message(content="Could not complete reel collection. Check the local app logs; no results are assumed.").send()
+        return
+    finally:
+        # Stop and join the UI bridge before rendering final results. A callback
+        # already queued by the worker is ignored once this flag is cleared.
+        progress_active.clear()
+        progress_task.cancel()
+        await asyncio.gather(progress_task, return_exceptions=True)
+    if not _is_current_public_search(generation):
+        await cl.Message(content="An earlier collection finished after a newer request and was discarded.").send()
+        return
+    progress_message.content = (
+        f"Collection finished for **{_md(keywords)}** · candidate attempts: "
+        f"**{_md(result.get('attempted_count', 0))}** · verified readable: "
+        f"**{_md(result.get('readable_count', 0))} / {target_readable}** · "
+        f"stop reason: **{_md(result.get('stop_reason') or 'not reported')}**."
+    )
+    await progress_message.update()
+    await cl.Message(content=_render_instagram_extraction(result, keywords, target_readable=target_readable)).send()
+
+
+async def _prompt_instagram_target_collection() -> None:
+    response = await cl.AskUserMessage(content=REEL_COLLECTION_PROMPT, timeout=180).send()
+    keywords = (response.get("output") or "").strip() if response else ""
+    if not keywords:
+        await cl.Message(content="No hashtag or phrase supplied. Nothing was searched.").send()
+        return
+    target_response = await cl.AskUserMessage(
+        content="How many readable reels should I target? Enter 1–50; leave blank for 25.", timeout=180,
+    ).send()
+    raw_target = (target_response.get("output") or "").strip() if target_response else ""
+    try:
+        target = 25 if not raw_target else int(raw_target)
+    except ValueError:
+        await cl.Message(content="Enter a whole number from 1 to 50; nothing was searched.").send()
+        return
+    await _send_instagram_target_collection(keywords, target)
 
 
 def _begin_public_search() -> int:
@@ -909,8 +1075,7 @@ async def on_chat_start() -> None:
     await ElementSidebar.set_elements([cl.Text(
         content=(
             "QUICK GUIDE\n\n"
-            "SEARCH A TOPIC\nClick Search a topic or send extract #finance / extract personal finance. Enter one hashtag or a phrase. "
-            "The app searches visible Google results and attempts to read up to five public post/reel pages in the headed browser. Searches run one at a time; a new request during an active search is rejected, not queued.\n\n"
+            "COLLECT REELS\nClick Collect reels or send collect #finance / collect personal finance. Enter a hashtag or phrase, then choose a readable-record target from 1 to 50 (default 25). Searches use visible Google results and may return fewer readable records. The existing extract command remains capped at five candidates. Searches run one at a time; a new request during an active search is rejected, not queued.\n\n"
             "WHAT THE RESULTS MEAN\nGoogle snippets are unverified context and are excluded from matching. Keyword matches and co-occurring hashtags use only visible text from readable post pages. "
             "The evidence summary shows matching readable posts / readable posts (each post counted once), readable pages / candidates, and posts with observed dates / readable posts. Matching uses visible text only. "
             "Results may be stale, incomplete, or unavailable; they are not an exhaustive search, trend, or popularity report. "
@@ -931,6 +1096,7 @@ async def on_chat_start() -> None:
     await cl.Message(
         content=WELCOME_MESSAGE,
         actions=[
+            cl.Action(name="prompt_instagram_target_collection", label="Collect reels", payload={}, icon="search"),
             cl.Action(name="prompt_instagram_extraction", label="Search a topic", payload={}, icon="search"),
             cl.Action(name="extract_instagram", label="Extract #finance", payload={"keywords": "#finance"}, icon="search"),
             cl.Action(name="extract_instagram", label="Extract personal finance", payload={"keywords": "personal finance"}, icon="search"),
@@ -976,6 +1142,14 @@ async def on_prompt_instagram_extraction(_action: cl.Action) -> None:
         await cl.context.emitter.task_end()
 
 
+@cl.action_callback("prompt_instagram_target_collection")
+async def on_prompt_instagram_target_collection(_action: cl.Action) -> None:
+    try:
+        await _prompt_instagram_target_collection()
+    finally:
+        await cl.context.emitter.task_end()
+
+
 async def _load_demo() -> None:
     if not SAMPLE_CSV.is_file():
         await cl.Message(content="The bundled example CSV is missing from this installation.").send()
@@ -1009,6 +1183,18 @@ async def on_message(message: cl.Message) -> None:
             await _prompt_instagram_extraction()
         else:
             await _send_instagram_extraction(keywords)
+        return
+    if command == "collect" or command.startswith("collect "):
+        phrase = text[len("collect"):].strip()
+        if not phrase:
+            await _prompt_instagram_target_collection()
+            return
+        match = re.fullmatch(r"(.+?)(?:\s+--target(?:-readable)?\s+(\d+))?", phrase, re.IGNORECASE)
+        if not match:
+            await cl.Message(content="Use `collect <hashtag or phrase> [--target N]`; N must be from 1 to 50 and defaults to 25.").send()
+            return
+        target = int(match.group(2)) if match.group(2) else 25
+        await _send_instagram_target_collection(match.group(1).strip(), target)
         return
     if command == "capture" or command.startswith("capture "):
         keywords = text[len("capture"):].strip()
